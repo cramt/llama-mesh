@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap;
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
@@ -89,10 +90,36 @@ async fn wait_for_preempt_clear(triggers: &[String]) {
     }
 }
 
-/// Run a single coordinator session. Returns cleanly on disconnect.
-/// Calls `std::process::exit(0)` on preemption — the RPC server thread
-/// can only be stopped by terminating the process.
-async fn run_session(args: &Args, node_id: &str, vram_mb: u64, gpu: &GpuType) -> Result<()> {
+/// Spawn `llama-mesh rpc-server` as a child process.
+fn spawn_rpc_child(rpc_host: &str, rpc_port: u16) -> Result<Child> {
+    let self_exe = std::env::current_exe().context("failed to find own binary path")?;
+    let endpoint = format!("{rpc_host}:{rpc_port}");
+
+    let child = Command::new(self_exe)
+        .arg("rpc-server")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to spawn rpc-server child process")?;
+
+    info!("spawned rpc-server child on {endpoint}");
+    Ok(child)
+}
+
+enum SessionEnd {
+    /// Coordinator disconnected — reconnect, RPC server stays up
+    Disconnected,
+    /// A preempt trigger was detected — caller should kill RPC and wait
+    Preempted(String),
+}
+
+async fn run_session(
+    args: &Args,
+    node_id: &str,
+    vram_mb: u64,
+    gpu: &GpuType,
+) -> Result<SessionEnd> {
     info!("connecting to coordinator at {}", args.coordinator);
     let (ws, _) = tokio_tungstenite::connect_async(&args.coordinator)
         .await
@@ -133,7 +160,7 @@ async fn run_session(args: &Args, node_id: &str, vram_mb: u64, gpu: &GpuType) ->
         None
     };
 
-    loop {
+    let result = loop {
         tokio::select! {
             msg = stream.next() => {
                 match msg {
@@ -148,11 +175,11 @@ async fn run_session(args: &Args, node_id: &str, vram_mb: u64, gpu: &GpuType) ->
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         info!("coordinator disconnected");
-                        break;
+                        break SessionEnd::Disconnected;
                     }
                     Some(Err(e)) => {
                         warn!("websocket error: {e}");
-                        break;
+                        break SessionEnd::Disconnected;
                     }
                     _ => {}
                 }
@@ -160,27 +187,23 @@ async fn run_session(args: &Args, node_id: &str, vram_mb: u64, gpu: &GpuType) ->
 
             trigger = preempt_rx.recv() => {
                 if let Some(process_name) = trigger {
-                    info!("preemption triggered by {process_name} — exiting for GPU release");
+                    info!("preemption triggered by {process_name}");
                     let drain = WorkerMsg::Draining {
                         reason: format!("{process_name} launched"),
                     };
                     let _ = sink
                         .send(Message::Text(serde_json::to_string(&drain).unwrap()))
                         .await;
-                    // Brief pause so the message actually sends
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    // Exit the process — the RPC server thread cannot be stopped gracefully.
-                    // systemd restarts us; we'll wait for the game to exit before re-joining.
-                    std::process::exit(0);
+                    break SessionEnd::Preempted(process_name);
                 }
             }
         }
-    }
+    };
 
     if let Some(h) = preempt_handle {
         h.abort();
     }
-    Ok(())
+    Ok(result)
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -189,12 +212,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     info!("llama-mesh worker starting as {node_id} ({gpu})");
 
-    // Wait for any preempt trigger to clear (e.g. game still running from last preemption)
-    if !args.preempt_triggers.is_empty() {
-        wait_for_preempt_clear(&args.preempt_triggers).await;
-    }
-
-    // Enumerate GPU devices
+    // Auto-detect GPU devices and VRAM
     let devices = ffi::enumerate_devices();
     for d in &devices {
         info!(
@@ -208,47 +226,72 @@ pub async fn run(args: Args) -> Result<()> {
         );
     }
 
-    let gpu_indices: Vec<usize> = devices.iter().filter(|d| d.is_gpu()).map(|d| d.index).collect();
-    if gpu_indices.is_empty() {
-        anyhow::bail!("no GPU devices found — nothing to serve over RPC");
-    }
-
     let total_vram_mb: u64 = devices
         .iter()
         .filter(|d| d.is_gpu())
         .map(|d| d.vram_total_mb)
         .sum();
 
-    // Start the RPC server in a dedicated thread (blocks forever)
-    let endpoint = format!("{}:{}", args.rpc_host, args.rpc_port);
-    let indices = gpu_indices.clone();
-    std::thread::spawn(move || {
-        ffi::run_rpc_server(&endpoint, &indices);
-    });
+    if total_vram_mb == 0 {
+        anyhow::bail!("no GPU devices found — nothing to serve over RPC");
+    }
 
     info!(
-        "RPC server started on {}:{} ({} GPU device(s), {}MB total VRAM)",
-        args.rpc_host,
-        args.rpc_port,
-        gpu_indices.len(),
+        "{} GPU device(s), {}MB total VRAM",
+        devices.iter().filter(|d| d.is_gpu()).count(),
         total_vram_mb,
     );
 
-    // Give the RPC server a moment to bind
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Reconnect loop — RPC server stays running across coordinator reconnects
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
 
     loop {
-        match run_session(&args, &node_id, total_vram_mb, &gpu).await {
-            Ok(()) => backoff = Duration::from_secs(1),
-            Err(e) => error!("session error: {e:#}"),
+        // Wait for any game to exit before starting the RPC server
+        if !args.preempt_triggers.is_empty() {
+            wait_for_preempt_clear(&args.preempt_triggers).await;
         }
 
-        info!("reconnecting in {}s...", backoff.as_secs());
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(max_backoff);
+        // Start RPC server as a child process (so we can kill it for preemption)
+        let mut rpc_child = spawn_rpc_child(&args.rpc_host, args.rpc_port)?;
+
+        // Give the RPC server a moment to bind
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Reconnect loop — RPC server stays running across coordinator reconnects
+        loop {
+            match run_session(&args, &node_id, total_vram_mb, &gpu).await {
+                Ok(SessionEnd::Disconnected) => {
+                    backoff = Duration::from_secs(1);
+                    info!("reconnecting in {}s...", backoff.as_secs());
+                    tokio::time::sleep(backoff).await;
+                    continue; // RPC server still running, just reconnect
+                }
+                Ok(SessionEnd::Preempted(process_name)) => {
+                    // Kill the RPC server to free the GPU
+                    info!("killing RPC server for preemption");
+                    rpc_child.kill().await.ok();
+                    rpc_child.wait().await.ok();
+
+                    info!("waiting for {process_name} to exit...");
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        if !is_process_running(&process_name) {
+                            break;
+                        }
+                    }
+                    info!("{process_name} exited, restarting RPC server");
+
+                    backoff = Duration::from_secs(1);
+                    break; // break inner loop → outer loop restarts RPC + reconnects
+                }
+                Err(e) => {
+                    error!("session error: {e:#}");
+                    info!("reconnecting in {}s...", backoff.as_secs());
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(max_backoff);
+                    continue;
+                }
+            }
+        }
     }
 }

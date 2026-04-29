@@ -1,6 +1,7 @@
 mod coord;
 mod ffi;
 mod protocol;
+mod rpc_server;
 mod worker;
 
 use anyhow::Result;
@@ -20,6 +21,9 @@ enum Commands {
     Worker(worker::Args),
     /// Run as the coordinator — accepts workers, manages topology, drives llama-swap
     Coord(coord::Args),
+    /// (internal) Run the RPC server directly — used by the worker as a child process
+    #[command(hide = true)]
+    RpcServer(rpc_server::Args),
 }
 
 #[tokio::main]
@@ -30,5 +34,6 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Worker(args) => worker::run(args).await,
         Commands::Coord(args) => coord::run(args).await,
+        Commands::RpcServer(args) => rpc_server::run(args),
     }
 }
