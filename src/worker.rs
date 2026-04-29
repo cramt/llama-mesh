@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap;
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -9,6 +10,7 @@ use tracing::{error, info, warn};
 
 use crate::ffi;
 use crate::protocol::{CoordinatorMsg, GpuType, WorkerAnnounce, WorkerMsg};
+use crate::tunnel;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -65,16 +67,12 @@ fn is_process_running(name: &str) -> bool {
                 .is_some_and(|s| s.chars().all(|c| c.is_ascii_digit()))
         })
         .any(|e| {
-            std::fs::read_to_string(e.path().join("comm"))
-                .is_ok_and(|comm| comm.trim() == name)
+            std::fs::read_to_string(e.path().join("comm")).is_ok_and(|comm| comm.trim() == name)
         })
 }
 
 fn any_trigger_running(triggers: &[String]) -> Option<String> {
-    triggers
-        .iter()
-        .find(|t| is_process_running(t))
-        .cloned()
+    triggers.iter().find(|t| is_process_running(t)).cloned()
 }
 
 /// Block until no preempt-trigger processes are running.
@@ -125,7 +123,18 @@ async fn run_session(
         .await
         .context("failed to connect to coordinator")?;
 
-    let (mut sink, mut stream) = ws.split();
+    let (mut sink, mut ws_stream) = ws.split();
+
+    // Shared WebSocket writer — tunnel stream tasks + control messages all
+    // send through this channel; a dedicated task drains it into the sink.
+    let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(64);
+    let writer_handle = tokio::spawn(async move {
+        while let Some(msg) = ws_rx.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
 
     // Announce
     let announce = WorkerMsg::Announce(WorkerAnnounce {
@@ -135,11 +144,16 @@ async fn run_session(
         rpc_port: args.rpc_port,
         preemptible: !args.preempt_triggers.is_empty(),
     });
-    sink.send(Message::Text(serde_json::to_string(&announce)?))
+    ws_tx
+        .send(Message::Text(serde_json::to_string(&announce)?))
         .await
         .context("failed to send announce")?;
 
     info!("announced to coordinator as {node_id}");
+
+    // Tunnel stream tracking
+    let mut streams: HashMap<u32, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let (close_tx, mut close_rx) = mpsc::channel::<u32>(32);
 
     // Preemption watcher
     let (preempt_tx, mut preempt_rx) = mpsc::channel::<String>(1);
@@ -160,18 +174,58 @@ async fn run_session(
         None
     };
 
+    let rpc_port = args.rpc_port;
+
     let result = loop {
         tokio::select! {
-            msg = stream.next() => {
+            msg = ws_stream.next() => {
                 match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        // Route binary frame to the correct tunnel stream
+                        if let Some((stream_id, payload)) = tunnel::decode_frame(&data) {
+                            if let Some(tx) = streams.get(&stream_id) {
+                                let _ = tx.send(payload.to_vec()).await;
+                            }
+                        }
+                    }
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<CoordinatorMsg>(&text) {
+                            Ok(CoordinatorMsg::TunnelOpen { stream_id }) => {
+                                info!("tunnel stream {stream_id} opening -> localhost:{rpc_port}");
+                                match tokio::net::TcpStream::connect(
+                                    format!("127.0.0.1:{rpc_port}")
+                                ).await {
+                                    Ok(tcp) => {
+                                        let data_tx = tunnel::spawn_stream(
+                                            stream_id,
+                                            tcp,
+                                            ws_tx.clone(),
+                                            close_tx.clone(),
+                                        );
+                                        streams.insert(stream_id, data_tx);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "failed to connect to local RPC for stream {stream_id}: {e}"
+                                        );
+                                        let close = WorkerMsg::TunnelClose { stream_id };
+                                        let _ = ws_tx
+                                            .send(Message::Text(
+                                                serde_json::to_string(&close).unwrap(),
+                                            ))
+                                            .await;
+                                    }
+                                }
+                            }
+                            Ok(CoordinatorMsg::TunnelClose { stream_id }) => {
+                                streams.remove(&stream_id);
+                            }
                             Ok(m) => info!("coordinator: {m:?}"),
                             Err(e) => warn!("bad coordinator message: {e}"),
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        let _ = sink.send(Message::Pong(data)).await;
+                        let _ = ws_tx.send(Message::Pong(data)).await;
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         info!("coordinator disconnected");
@@ -185,13 +239,24 @@ async fn run_session(
                 }
             }
 
+            closed_id = close_rx.recv() => {
+                // A tunnel stream's TCP side closed — notify the coordinator
+                if let Some(stream_id) = closed_id {
+                    streams.remove(&stream_id);
+                    let close = WorkerMsg::TunnelClose { stream_id };
+                    let _ = ws_tx
+                        .send(Message::Text(serde_json::to_string(&close).unwrap()))
+                        .await;
+                }
+            }
+
             trigger = preempt_rx.recv() => {
                 if let Some(process_name) = trigger {
                     info!("preemption triggered by {process_name}");
                     let drain = WorkerMsg::Draining {
                         reason: format!("{process_name} launched"),
                     };
-                    let _ = sink
+                    let _ = ws_tx
                         .send(Message::Text(serde_json::to_string(&drain).unwrap()))
                         .await;
                     break SessionEnd::Preempted(process_name);
@@ -203,6 +268,8 @@ async fn run_session(
     if let Some(h) = preempt_handle {
         h.abort();
     }
+    writer_handle.abort();
+
     Ok(result)
 }
 
@@ -282,7 +349,7 @@ pub async fn run(args: Args) -> Result<()> {
                     info!("{process_name} exited, restarting RPC server");
 
                     backoff = Duration::from_secs(1);
-                    break; // break inner loop → outer loop restarts RPC + reconnects
+                    break; // break inner loop -> outer loop restarts RPC + reconnects
                 }
                 Err(e) => {
                     error!("session error: {e:#}");

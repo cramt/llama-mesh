@@ -19,7 +19,11 @@ pub struct Args {
 /// Enumerate GPU devices and run the RPC server. **Blocks forever.**
 pub fn run(args: Args) -> Result<()> {
     let devices = ffi::enumerate_devices();
-    let gpu_indices: Vec<usize> = devices.iter().filter(|d| d.is_gpu()).map(|d| d.index).collect();
+    let gpu_indices: Vec<usize> = devices
+        .iter()
+        .filter(|d| d.is_gpu())
+        .map(|d| d.index)
+        .collect();
 
     if gpu_indices.is_empty() {
         anyhow::bail!("no GPU devices found");

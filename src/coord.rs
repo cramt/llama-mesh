@@ -3,9 +3,10 @@ use clap;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
@@ -15,6 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::protocol::{CoordinatorMsg, WorkerAnnounce, WorkerMsg};
+use crate::tunnel;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -104,7 +106,7 @@ struct TopologyPlan {
 struct ConnectedWorker {
     conn_id: u64,
     announce: WorkerAnnounce,
-    peer_ip: IpAddr,
+    proxy_port: u16,
     draining: bool,
 }
 
@@ -125,9 +127,10 @@ fn plan_topology(local_vram_mb: u64, workers: &HashMap<String, ConnectedWorker>)
         };
     }
 
+    // RPC traffic tunnels through WebSocket — llama-server connects to local proxy ports
     let rpc_endpoints: Vec<String> = ready
         .iter()
-        .map(|w| format!("{}:{}", w.peer_ip, w.announce.rpc_port))
+        .map(|w| format!("127.0.0.1:{}", w.proxy_port))
         .collect();
 
     let mut splits = Vec::with_capacity(ready.len() + 1);
@@ -242,21 +245,21 @@ async fn write_and_reload_swap(
 // ---------------------------------------------------------------------------
 
 enum CoordEvent {
-    WorkerJoined {
+    Joined {
         conn_id: u64,
         node_id: String,
         announce: WorkerAnnounce,
-        peer_ip: IpAddr,
+        proxy_port: u16,
     },
-    WorkerLeft {
+    Left {
         conn_id: u64,
         node_id: String,
     },
-    WorkerDraining {
+    Draining {
         conn_id: u64,
         node_id: String,
     },
-    WorkerResuming {
+    Resuming {
         conn_id: u64,
         node_id: String,
     },
@@ -264,35 +267,32 @@ enum CoordEvent {
 
 fn apply_event(workers: &mut HashMap<String, ConnectedWorker>, event: CoordEvent) -> bool {
     match event {
-        CoordEvent::WorkerJoined {
+        CoordEvent::Joined {
             conn_id,
             node_id,
             announce,
-            peer_ip,
+            proxy_port,
         } => {
             workers.insert(
                 node_id,
                 ConnectedWorker {
                     conn_id,
                     announce,
-                    peer_ip,
+                    proxy_port,
                     draining: false,
                 },
             );
             true
         }
-        CoordEvent::WorkerLeft { conn_id, node_id } => {
-            if workers
-                .get(&node_id)
-                .is_some_and(|w| w.conn_id == conn_id)
-            {
+        CoordEvent::Left { conn_id, node_id } => {
+            if workers.get(&node_id).is_some_and(|w| w.conn_id == conn_id) {
                 workers.remove(&node_id);
                 true
             } else {
                 false
             }
         }
-        CoordEvent::WorkerDraining { conn_id, node_id } => {
+        CoordEvent::Draining { conn_id, node_id } => {
             if let Some(w) = workers.get_mut(&node_id) {
                 if w.conn_id == conn_id && !w.draining {
                     w.draining = true;
@@ -301,7 +301,7 @@ fn apply_event(workers: &mut HashMap<String, ConnectedWorker>, event: CoordEvent
             }
             false
         }
-        CoordEvent::WorkerResuming { conn_id, node_id } => {
+        CoordEvent::Resuming { conn_id, node_id } => {
             if let Some(w) = workers.get_mut(&node_id) {
                 if w.conn_id == conn_id && w.draining {
                     w.draining = false;
@@ -345,6 +345,51 @@ async fn coordinator_task(config: Config, mut rx: mpsc::Receiver<CoordEvent>) ->
 }
 
 // ---------------------------------------------------------------------------
+// Proxy TCP accept task — one per worker connection
+// ---------------------------------------------------------------------------
+
+/// Accepts TCP connections from llama-server on the proxy port and sets up
+/// tunnel streams through the WebSocket to the remote worker.
+async fn proxy_accept_task(
+    listener: TcpListener,
+    ws_tx: mpsc::Sender<Message>,
+    close_tx: mpsc::Sender<u32>,
+    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+) {
+    let mut next_id = 1u32;
+    loop {
+        match listener.accept().await {
+            Ok((tcp_stream, _)) => {
+                let stream_id = next_id;
+                next_id += 1;
+
+                // Send TunnelOpen before spawning stream tasks — this guarantees
+                // the worker sees TunnelOpen before any binary data frames, since
+                // both go through the same ordered ws_tx channel.
+                let open = CoordinatorMsg::TunnelOpen { stream_id };
+                if ws_tx
+                    .send(Message::Text(serde_json::to_string(&open).unwrap()))
+                    .await
+                    .is_err()
+                {
+                    break; // WebSocket closed
+                }
+
+                let data_tx =
+                    tunnel::spawn_stream(stream_id, tcp_stream, ws_tx.clone(), close_tx.clone());
+                streams.lock().unwrap().insert(stream_id, data_tx);
+
+                info!("tunnel stream {stream_id} opened");
+            }
+            Err(e) => {
+                warn!("proxy accept error: {e}");
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket connection handler
 // ---------------------------------------------------------------------------
 
@@ -363,10 +408,21 @@ async fn handle_connection(
         }
     };
 
-    let (mut sink, mut stream) = ws.split();
+    let (mut sink, mut ws_stream) = ws.split();
+
+    // Shared WebSocket writer — tunnel stream tasks + control messages all
+    // send through this channel; a dedicated task drains it into the sink.
+    let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(64);
+    let writer_handle = tokio::spawn(async move {
+        while let Some(msg) = ws_rx.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
 
     // First message must be Announce
-    let announce = match stream.next().await {
+    let announce = match ws_stream.next().await {
         Some(Ok(Message::Text(text))) => match serde_json::from_str::<WorkerMsg>(&text) {
             Ok(WorkerMsg::Announce(a)) => a,
             Ok(other) => {
@@ -385,68 +441,126 @@ async fn handle_connection(
     };
 
     let node_id = announce.node_id.clone();
+
+    // Bind a local proxy port for this worker — llama-server connects here,
+    // and the data tunnels through the WebSocket to the worker's RPC server.
+    let proxy_listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            error!("failed to bind proxy listener for {node_id}: {e}");
+            return;
+        }
+    };
+    let proxy_port = proxy_listener.local_addr().unwrap().port();
+
     info!(
-        "worker connected: {} ({}, {}MB VRAM, preemptible={}) [conn {}]",
-        node_id, announce.gpu, announce.vram_mb, announce.preemptible, conn_id
+        "worker connected: {} ({}, {}MB VRAM, preemptible={}) [conn {}, proxy port {}]",
+        node_id, announce.gpu, announce.vram_mb, announce.preemptible, conn_id, proxy_port
     );
 
     let _ = tx
-        .send(CoordEvent::WorkerJoined {
+        .send(CoordEvent::Joined {
             conn_id,
             node_id: node_id.clone(),
             announce,
-            peer_ip: peer_addr.ip(),
+            proxy_port,
         })
         .await;
 
+    // Send Ack through the shared writer
     let ack = CoordinatorMsg::Ack {
         node_id: node_id.clone(),
     };
-    let _ = sink
+    let _ = ws_tx
         .send(Message::Text(serde_json::to_string(&ack).unwrap()))
         .await;
 
-    // Hold connection — its existence IS the liveness signal
+    // Tunnel stream tracking — shared with the proxy accept task
+    let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (close_tx, mut close_rx) = mpsc::channel::<u32>(32);
+
+    let proxy_handle = tokio::spawn(proxy_accept_task(
+        proxy_listener,
+        ws_tx.clone(),
+        close_tx,
+        streams.clone(),
+    ));
+
+    // Main loop — multiplex control messages and tunnel binary frames
     loop {
-        match stream.next().await {
-            Some(Ok(Message::Text(text))) => match serde_json::from_str::<WorkerMsg>(&text) {
-                Ok(WorkerMsg::Draining { reason }) => {
-                    info!("worker {node_id} draining: {reason}");
-                    let _ = tx
-                        .send(CoordEvent::WorkerDraining {
-                            conn_id,
-                            node_id: node_id.clone(),
-                        })
+        tokio::select! {
+            msg = ws_stream.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        if let Some((stream_id, payload)) = tunnel::decode_frame(&data) {
+                            let sender = streams.lock().unwrap().get(&stream_id).cloned();
+                            if let Some(sender) = sender {
+                                let _ = sender.send(payload.to_vec()).await;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<WorkerMsg>(&text) {
+                            Ok(WorkerMsg::Draining { reason }) => {
+                                info!("worker {node_id} draining: {reason}");
+                                let _ = tx
+                                    .send(CoordEvent::Draining {
+                                        conn_id,
+                                        node_id: node_id.clone(),
+                                    })
+                                    .await;
+                            }
+                            Ok(WorkerMsg::Resuming) => {
+                                info!("worker {node_id} resuming");
+                                let _ = tx
+                                    .send(CoordEvent::Resuming {
+                                        conn_id,
+                                        node_id: node_id.clone(),
+                                    })
+                                    .await;
+                            }
+                            Ok(WorkerMsg::TunnelClose { stream_id }) => {
+                                streams.lock().unwrap().remove(&stream_id);
+                            }
+                            Ok(WorkerMsg::Announce(_)) => {
+                                warn!("unexpected re-announce from {node_id}, ignoring");
+                            }
+                            Err(e) => warn!("bad message from {node_id}: {e}"),
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = ws_tx.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        warn!("websocket error from {node_id}: {e}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            closed_id = close_rx.recv() => {
+                // A tunnel stream's TCP side closed — notify the worker
+                if let Some(stream_id) = closed_id {
+                    streams.lock().unwrap().remove(&stream_id);
+                    let close = CoordinatorMsg::TunnelClose { stream_id };
+                    let _ = ws_tx
+                        .send(Message::Text(serde_json::to_string(&close).unwrap()))
                         .await;
                 }
-                Ok(WorkerMsg::Resuming) => {
-                    info!("worker {node_id} resuming");
-                    let _ = tx
-                        .send(CoordEvent::WorkerResuming {
-                            conn_id,
-                            node_id: node_id.clone(),
-                        })
-                        .await;
-                }
-                Ok(WorkerMsg::Announce(_)) => {
-                    warn!("unexpected re-announce from {node_id}, ignoring");
-                }
-                Err(e) => warn!("bad message from {node_id}: {e}"),
-            },
-            Some(Ok(Message::Ping(data))) => {
-                let _ = sink.send(Message::Pong(data)).await;
             }
-            Some(Ok(Message::Close(_))) | None => break,
-            Some(Err(e)) => {
-                warn!("websocket error from {node_id}: {e}");
-                break;
-            }
-            _ => {}
         }
     }
 
+    // Cleanup — aborting the writer drops ws_rx, which makes all ws_tx.send()
+    // calls in tunnel stream tasks fail, cascading a clean shutdown.
+    proxy_handle.abort();
+    writer_handle.abort();
+
     info!("worker disconnected: {node_id} [conn {conn_id}]");
-    let _ = tx.send(CoordEvent::WorkerLeft { conn_id, node_id }).await;
+    let _ = tx.send(CoordEvent::Left { conn_id, node_id }).await;
 }
 
 // ---------------------------------------------------------------------------
