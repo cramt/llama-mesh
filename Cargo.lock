@@ -444,42 +444,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
-name = "llama-mesh-coord"
+name = "llama-mesh"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "futures-util",
- "llama-mesh-protocol",
  "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
  "tokio-tungstenite",
  "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "llama-mesh-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "llama-mesh-worker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "futures-util",
- "llama-mesh-protocol",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
 ]

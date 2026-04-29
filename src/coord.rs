@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap;
 use futures_util::{SinkExt, StreamExt};
-use llama_mesh_protocol::{CoordinatorMsg, WorkerAnnounce, WorkerMsg};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -15,16 +14,16 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
+use crate::protocol::{CoordinatorMsg, WorkerAnnounce, WorkerMsg};
+
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
-#[derive(Parser)]
-#[command(name = "llama-mesh-coord")]
-#[command(about = "Coordinator for llama-mesh distributed inference")]
-struct Args {
+#[derive(clap::Args)]
+pub struct Args {
     /// Address to listen for worker WebSocket connections
     #[arg(long, default_value = "0.0.0.0:50050")]
     listen: String,
@@ -40,18 +39,12 @@ struct Args {
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    /// Path to llama-swap binary
     swap_bin: PathBuf,
-    /// Address llama-swap listens on (e.g. "0.0.0.0:11434")
     swap_listen: String,
-    /// Path to the llama-server binary (the GPU-specific build)
     llama_server_bin: PathBuf,
-    /// Where the generated llama-swap YAML config is written
     swap_config_path: PathBuf,
-    /// VRAM of the coordinator's local GPU (MB). 0 = no local GPU.
     #[serde(default)]
     local_vram_mb: u64,
-    /// Models to serve
     #[serde(default)]
     models: Vec<ModelConfig>,
 }
@@ -82,7 +75,7 @@ fn default_ttl() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// llama-swap YAML config
+// llama-swap YAML
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -100,7 +93,7 @@ struct SwapModelEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Topology planning
+// Topology
 // ---------------------------------------------------------------------------
 
 struct TopologyPlan {
@@ -118,7 +111,6 @@ struct ConnectedWorker {
 fn plan_topology(local_vram_mb: u64, workers: &HashMap<String, ConnectedWorker>) -> TopologyPlan {
     let mut ready: Vec<&ConnectedWorker> = workers.values().filter(|w| !w.draining).collect();
 
-    // Non-preemptible first, then highest VRAM first
     ready.sort_by(|a, b| {
         a.announce
             .preemptible
@@ -138,7 +130,6 @@ fn plan_topology(local_vram_mb: u64, workers: &HashMap<String, ConnectedWorker>)
         .map(|w| format!("{}:{}", w.peer_ip, w.announce.rpc_port))
         .collect();
 
-    // First value = coordinator's local GPU, rest = workers in order
     let mut splits = Vec::with_capacity(ready.len() + 1);
     if local_vram_mb > 0 {
         splits.push(local_vram_mb.to_string());
@@ -221,7 +212,6 @@ async fn write_and_reload_swap(
         plan.rpc_endpoints.join(", ")
     );
 
-    // Kill old swap process
     if let Some(ref mut child) = swap_child {
         info!("restarting llama-swap for topology change");
         child.kill().await.ok();
@@ -248,7 +238,7 @@ async fn write_and_reload_swap(
 }
 
 // ---------------------------------------------------------------------------
-// Coordinator events
+// Events
 // ---------------------------------------------------------------------------
 
 enum CoordEvent {
@@ -324,14 +314,13 @@ fn apply_event(workers: &mut HashMap<String, ConnectedWorker>, event: CoordEvent
 }
 
 // ---------------------------------------------------------------------------
-// Coordinator task — single owner of worker state + swap process
+// Coordinator task
 // ---------------------------------------------------------------------------
 
 async fn coordinator_task(config: Config, mut rx: mpsc::Receiver<CoordEvent>) -> Result<()> {
     let mut workers: HashMap<String, ConnectedWorker> = HashMap::new();
     let mut swap_child: Option<Child> = None;
 
-    // Start with no workers
     let plan = plan_topology(config.local_vram_mb, &workers);
     write_and_reload_swap(&config, &plan, &mut swap_child).await?;
 
@@ -339,7 +328,7 @@ async fn coordinator_task(config: Config, mut rx: mpsc::Receiver<CoordEvent>) ->
         let changed = apply_event(&mut workers, event);
 
         if changed {
-            // Debounce: wait briefly so multiple simultaneous joins batch together
+            // Debounce: batch events arriving close together
             tokio::time::sleep(Duration::from_millis(500)).await;
             while let Ok(extra) = rx.try_recv() {
                 apply_event(&mut workers, extra);
@@ -349,9 +338,6 @@ async fn coordinator_task(config: Config, mut rx: mpsc::Receiver<CoordEvent>) ->
             if let Err(e) = write_and_reload_swap(&config, &plan, &mut swap_child).await {
                 error!("failed to reload swap: {e:#}");
             }
-
-            // Notify all workers about the new topology
-            // (they don't need this to function, but it's nice for logging)
         }
     }
 
@@ -359,7 +345,7 @@ async fn coordinator_task(config: Config, mut rx: mpsc::Receiver<CoordEvent>) ->
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket connection handler (one per worker)
+// WebSocket connection handler
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(
@@ -413,7 +399,6 @@ async fn handle_connection(
         })
         .await;
 
-    // Ack
     let ack = CoordinatorMsg::Ack {
         node_id: node_id.clone(),
     };
@@ -421,7 +406,7 @@ async fn handle_connection(
         .send(Message::Text(serde_json::to_string(&ack).unwrap()))
         .await;
 
-    // Hold connection open — the existence of this connection IS the liveness signal
+    // Hold connection — its existence IS the liveness signal
     loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => match serde_json::from_str::<WorkerMsg>(&text) {
@@ -446,9 +431,7 @@ async fn handle_connection(
                 Ok(WorkerMsg::Announce(_)) => {
                     warn!("unexpected re-announce from {node_id}, ignoring");
                 }
-                Err(e) => {
-                    warn!("bad message from {node_id}: {e}");
-                }
+                Err(e) => warn!("bad message from {node_id}: {e}"),
             },
             Some(Ok(Message::Ping(data))) => {
                 let _ = sink.send(Message::Pong(data)).await;
@@ -463,24 +446,14 @@ async fn handle_connection(
     }
 
     info!("worker disconnected: {node_id} [conn {conn_id}]");
-    let _ = tx
-        .send(CoordEvent::WorkerLeft {
-            conn_id,
-            node_id,
-        })
-        .await;
+    let _ = tx.send(CoordEvent::WorkerLeft { conn_id, node_id }).await;
 }
 
 // ---------------------------------------------------------------------------
-// main
+// Entrypoint
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-
-    let args = Args::parse();
-
+pub async fn run(args: Args) -> Result<()> {
     let config_str = std::fs::read_to_string(&args.config)
         .with_context(|| format!("failed to read config: {}", args.config.display()))?;
     let config: Config = toml::from_str(&config_str).context("failed to parse config")?;
@@ -499,7 +472,6 @@ async fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel(32);
 
-    // Coordinator task owns all mutable state — single writer, no locks needed
     tokio::spawn(async move {
         if let Err(e) = coordinator_task(config, rx).await {
             error!("coordinator task failed: {e:#}");

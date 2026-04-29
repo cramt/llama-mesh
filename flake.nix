@@ -23,6 +23,11 @@
       pkgs,
       craneLib,
     }: let
+      # CPU-only RPC-enabled llama-cpp for linking at build time.
+      # GPU backends (CUDA/ROCm) are loaded dynamically at runtime —
+      # the NixOS module sets LD_LIBRARY_PATH to the right llama-cpp build.
+      llama-cpp-rpc = pkgs.llama-cpp.override {rpcSupport = true;};
+
       src = craneLib.cleanCargoSource ./.;
 
       commonArgs = {
@@ -30,38 +35,33 @@
         pname = "llama-mesh";
         version = "0.1.0";
         strictDeps = true;
+        buildInputs = [llama-cpp-rpc];
+
+        # Ensure the Rust linker can find libggml-rpc.so and friends
+        LIBRARY_PATH = "${llama-cpp-rpc}/lib";
       };
 
-      # Build deps once, share across both binaries
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-      llama-mesh-worker = craneLib.buildPackage (commonArgs
+      llama-mesh = craneLib.buildPackage (commonArgs
         // {
           inherit cargoArtifacts;
-          pname = "llama-mesh-worker";
-          cargoExtraArgs = "-p llama-mesh-worker";
-        });
-
-      llama-mesh-coord = craneLib.buildPackage (commonArgs
-        // {
-          inherit cargoArtifacts;
-          pname = "llama-mesh-coord";
-          cargoExtraArgs = "-p llama-mesh-coord";
         });
     in {
-      default = pkgs.symlinkJoin {
-        name = "llama-mesh";
-        paths = [llama-mesh-worker llama-mesh-coord];
-      };
-      inherit llama-mesh-worker llama-mesh-coord;
+      default = llama-mesh;
     });
 
     devShells = forEachSystem ({
       pkgs,
       craneLib,
-    }: {
+    }: let
+      llama-cpp-rpc = pkgs.llama-cpp.override {rpcSupport = true;};
+    in {
       default = craneLib.devShell {
         packages = [pkgs.rust-analyzer];
+        buildInputs = [llama-cpp-rpc];
+        LIBRARY_PATH = "${llama-cpp-rpc}/lib";
+        LD_LIBRARY_PATH = "${llama-cpp-rpc}/lib";
       };
     });
   };
