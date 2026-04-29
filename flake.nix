@@ -6,7 +6,7 @@
     crane.url = "github:ipetkov/crane";
   };
 
-  outputs = {
+  outputs = self: {
     nixpkgs,
     crane,
     ...
@@ -50,6 +50,8 @@
     in {
       default = llama-mesh;
     });
+
+    nixosModules.default = import ./nix/module.nix self;
 
     devShells = forEachSystem ({
       pkgs,
