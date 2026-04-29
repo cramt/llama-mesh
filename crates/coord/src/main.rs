@@ -1,0 +1,525 @@
+use anyhow::{Context, Result};
+use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
+use llama_mesh_protocol::{CoordinatorMsg, WorkerAnnounce, WorkerMsg};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{error, info, warn};
+
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+#[derive(Parser)]
+#[command(name = "llama-mesh-coord")]
+#[command(about = "Coordinator for llama-mesh distributed inference")]
+struct Args {
+    /// Address to listen for worker WebSocket connections
+    #[arg(long, default_value = "0.0.0.0:50050")]
+    listen: String,
+
+    /// Path to coordinator config file (TOML)
+    #[arg(long)]
+    config: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// Config (TOML)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    /// Path to llama-swap binary
+    swap_bin: PathBuf,
+    /// Address llama-swap listens on (e.g. "0.0.0.0:11434")
+    swap_listen: String,
+    /// Path to the llama-server binary (the GPU-specific build)
+    llama_server_bin: PathBuf,
+    /// Where the generated llama-swap YAML config is written
+    swap_config_path: PathBuf,
+    /// VRAM of the coordinator's local GPU (MB). 0 = no local GPU.
+    #[serde(default)]
+    local_vram_mb: u64,
+    /// Models to serve
+    #[serde(default)]
+    models: Vec<ModelConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelConfig {
+    name: String,
+    path: PathBuf,
+    #[serde(default = "default_model_args")]
+    args: Vec<String>,
+    #[serde(default = "default_ttl")]
+    ttl: u64,
+}
+
+fn default_model_args() -> Vec<String> {
+    vec![
+        "-ngl".into(),
+        "999".into(),
+        "-c".into(),
+        "16384".into(),
+        "--flash-attn".into(),
+        "on".into(),
+    ]
+}
+
+fn default_ttl() -> u64 {
+    300
+}
+
+// ---------------------------------------------------------------------------
+// llama-swap YAML config
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SwapConfig {
+    health_check_timeout: u64,
+    log_level: String,
+    models: HashMap<String, SwapModelEntry>,
+}
+
+#[derive(Serialize)]
+struct SwapModelEntry {
+    cmd: String,
+    ttl: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Topology planning
+// ---------------------------------------------------------------------------
+
+struct TopologyPlan {
+    rpc_endpoints: Vec<String>,
+    tensor_split: Option<String>,
+}
+
+struct ConnectedWorker {
+    conn_id: u64,
+    announce: WorkerAnnounce,
+    peer_ip: IpAddr,
+    draining: bool,
+}
+
+fn plan_topology(local_vram_mb: u64, workers: &HashMap<String, ConnectedWorker>) -> TopologyPlan {
+    let mut ready: Vec<&ConnectedWorker> = workers.values().filter(|w| !w.draining).collect();
+
+    // Non-preemptible first, then highest VRAM first
+    ready.sort_by(|a, b| {
+        a.announce
+            .preemptible
+            .cmp(&b.announce.preemptible)
+            .then_with(|| b.announce.vram_mb.cmp(&a.announce.vram_mb))
+    });
+
+    if ready.is_empty() {
+        return TopologyPlan {
+            rpc_endpoints: vec![],
+            tensor_split: None,
+        };
+    }
+
+    let rpc_endpoints: Vec<String> = ready
+        .iter()
+        .map(|w| format!("{}:{}", w.peer_ip, w.announce.rpc_port))
+        .collect();
+
+    // First value = coordinator's local GPU, rest = workers in order
+    let mut splits = Vec::with_capacity(ready.len() + 1);
+    if local_vram_mb > 0 {
+        splits.push(local_vram_mb.to_string());
+    }
+    for w in &ready {
+        splits.push(w.announce.vram_mb.to_string());
+    }
+
+    TopologyPlan {
+        rpc_endpoints,
+        tensor_split: Some(splits.join(",")),
+    }
+}
+
+fn generate_swap_config(config: &Config, plan: &TopologyPlan) -> SwapConfig {
+    let mut models = HashMap::new();
+
+    for model in &config.models {
+        let mut cmd_parts: Vec<String> = vec![
+            config.llama_server_bin.display().to_string(),
+            "--model".into(),
+            model.path.display().to_string(),
+            "--port".into(),
+            "${PORT}".into(),
+            "--host".into(),
+            "127.0.0.1".into(),
+        ];
+
+        if !plan.rpc_endpoints.is_empty() {
+            cmd_parts.push("--rpc".into());
+            cmd_parts.push(plan.rpc_endpoints.join(","));
+        }
+
+        if let Some(ref ts) = plan.tensor_split {
+            cmd_parts.push("--tensor-split".into());
+            cmd_parts.push(ts.clone());
+        }
+
+        cmd_parts.extend(model.args.iter().cloned());
+
+        models.insert(
+            model.name.clone(),
+            SwapModelEntry {
+                cmd: cmd_parts.join(" "),
+                ttl: model.ttl,
+            },
+        );
+    }
+
+    SwapConfig {
+        health_check_timeout: 600,
+        log_level: "info".into(),
+        models,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Swap process management
+// ---------------------------------------------------------------------------
+
+async fn write_and_reload_swap(
+    config: &Config,
+    plan: &TopologyPlan,
+    swap_child: &mut Option<Child>,
+) -> Result<()> {
+    let swap_config = generate_swap_config(config, plan);
+    let yaml = serde_yaml::to_string(&swap_config)?;
+
+    if let Some(parent) = config.swap_config_path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+
+    tokio::fs::write(&config.swap_config_path, &yaml)
+        .await
+        .context("failed to write swap config")?;
+
+    info!(
+        "topology: {} worker(s), rpc=[{}]",
+        plan.rpc_endpoints.len(),
+        plan.rpc_endpoints.join(", ")
+    );
+
+    // Kill old swap process
+    if let Some(ref mut child) = swap_child {
+        info!("restarting llama-swap for topology change");
+        child.kill().await.ok();
+        child.wait().await.ok();
+    }
+
+    let child = Command::new(&config.swap_bin)
+        .arg("-config")
+        .arg(&config.swap_config_path)
+        .arg("-listen")
+        .arg(&config.swap_listen)
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to start llama-swap")?;
+
+    info!(
+        "llama-swap listening on {} (config: {})",
+        config.swap_listen,
+        config.swap_config_path.display()
+    );
+    *swap_child = Some(child);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator events
+// ---------------------------------------------------------------------------
+
+enum CoordEvent {
+    WorkerJoined {
+        conn_id: u64,
+        node_id: String,
+        announce: WorkerAnnounce,
+        peer_ip: IpAddr,
+    },
+    WorkerLeft {
+        conn_id: u64,
+        node_id: String,
+    },
+    WorkerDraining {
+        conn_id: u64,
+        node_id: String,
+    },
+    WorkerResuming {
+        conn_id: u64,
+        node_id: String,
+    },
+}
+
+fn apply_event(workers: &mut HashMap<String, ConnectedWorker>, event: CoordEvent) -> bool {
+    match event {
+        CoordEvent::WorkerJoined {
+            conn_id,
+            node_id,
+            announce,
+            peer_ip,
+        } => {
+            workers.insert(
+                node_id,
+                ConnectedWorker {
+                    conn_id,
+                    announce,
+                    peer_ip,
+                    draining: false,
+                },
+            );
+            true
+        }
+        CoordEvent::WorkerLeft { conn_id, node_id } => {
+            if workers
+                .get(&node_id)
+                .is_some_and(|w| w.conn_id == conn_id)
+            {
+                workers.remove(&node_id);
+                true
+            } else {
+                false
+            }
+        }
+        CoordEvent::WorkerDraining { conn_id, node_id } => {
+            if let Some(w) = workers.get_mut(&node_id) {
+                if w.conn_id == conn_id && !w.draining {
+                    w.draining = true;
+                    return true;
+                }
+            }
+            false
+        }
+        CoordEvent::WorkerResuming { conn_id, node_id } => {
+            if let Some(w) = workers.get_mut(&node_id) {
+                if w.conn_id == conn_id && w.draining {
+                    w.draining = false;
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator task — single owner of worker state + swap process
+// ---------------------------------------------------------------------------
+
+async fn coordinator_task(config: Config, mut rx: mpsc::Receiver<CoordEvent>) -> Result<()> {
+    let mut workers: HashMap<String, ConnectedWorker> = HashMap::new();
+    let mut swap_child: Option<Child> = None;
+
+    // Start with no workers
+    let plan = plan_topology(config.local_vram_mb, &workers);
+    write_and_reload_swap(&config, &plan, &mut swap_child).await?;
+
+    while let Some(event) = rx.recv().await {
+        let changed = apply_event(&mut workers, event);
+
+        if changed {
+            // Debounce: wait briefly so multiple simultaneous joins batch together
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            while let Ok(extra) = rx.try_recv() {
+                apply_event(&mut workers, extra);
+            }
+
+            let plan = plan_topology(config.local_vram_mb, &workers);
+            if let Err(e) = write_and_reload_swap(&config, &plan, &mut swap_child).await {
+                error!("failed to reload swap: {e:#}");
+            }
+
+            // Notify all workers about the new topology
+            // (they don't need this to function, but it's nice for logging)
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket connection handler (one per worker)
+// ---------------------------------------------------------------------------
+
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    tx: mpsc::Sender<CoordEvent>,
+) {
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+
+    let ws = match accept_async(stream).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            warn!("websocket handshake failed from {peer_addr}: {e}");
+            return;
+        }
+    };
+
+    let (mut sink, mut stream) = ws.split();
+
+    // First message must be Announce
+    let announce = match stream.next().await {
+        Some(Ok(Message::Text(text))) => match serde_json::from_str::<WorkerMsg>(&text) {
+            Ok(WorkerMsg::Announce(a)) => a,
+            Ok(other) => {
+                warn!("expected Announce from {peer_addr}, got {other:?}");
+                return;
+            }
+            Err(e) => {
+                warn!("invalid message from {peer_addr}: {e}");
+                return;
+            }
+        },
+        other => {
+            warn!("unexpected first frame from {peer_addr}: {other:?}");
+            return;
+        }
+    };
+
+    let node_id = announce.node_id.clone();
+    info!(
+        "worker connected: {} ({}, {}MB VRAM, preemptible={}) [conn {}]",
+        node_id, announce.gpu, announce.vram_mb, announce.preemptible, conn_id
+    );
+
+    let _ = tx
+        .send(CoordEvent::WorkerJoined {
+            conn_id,
+            node_id: node_id.clone(),
+            announce,
+            peer_ip: peer_addr.ip(),
+        })
+        .await;
+
+    // Ack
+    let ack = CoordinatorMsg::Ack {
+        node_id: node_id.clone(),
+    };
+    let _ = sink
+        .send(Message::Text(serde_json::to_string(&ack).unwrap()))
+        .await;
+
+    // Hold connection open — the existence of this connection IS the liveness signal
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(text))) => match serde_json::from_str::<WorkerMsg>(&text) {
+                Ok(WorkerMsg::Draining { reason }) => {
+                    info!("worker {node_id} draining: {reason}");
+                    let _ = tx
+                        .send(CoordEvent::WorkerDraining {
+                            conn_id,
+                            node_id: node_id.clone(),
+                        })
+                        .await;
+                }
+                Ok(WorkerMsg::Resuming) => {
+                    info!("worker {node_id} resuming");
+                    let _ = tx
+                        .send(CoordEvent::WorkerResuming {
+                            conn_id,
+                            node_id: node_id.clone(),
+                        })
+                        .await;
+                }
+                Ok(WorkerMsg::Announce(_)) => {
+                    warn!("unexpected re-announce from {node_id}, ignoring");
+                }
+                Err(e) => {
+                    warn!("bad message from {node_id}: {e}");
+                }
+            },
+            Some(Ok(Message::Ping(data))) => {
+                let _ = sink.send(Message::Pong(data)).await;
+            }
+            Some(Ok(Message::Close(_))) | None => break,
+            Some(Err(e)) => {
+                warn!("websocket error from {node_id}: {e}");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    info!("worker disconnected: {node_id} [conn {conn_id}]");
+    let _ = tx
+        .send(CoordEvent::WorkerLeft {
+            conn_id,
+            node_id,
+        })
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let args = Args::parse();
+
+    let config_str = std::fs::read_to_string(&args.config)
+        .with_context(|| format!("failed to read config: {}", args.config.display()))?;
+    let config: Config = toml::from_str(&config_str).context("failed to parse config")?;
+
+    info!("llama-mesh coordinator starting on {}", args.listen);
+    info!("local VRAM: {}MB", config.local_vram_mb);
+    info!(
+        "models: {}",
+        config
+            .models
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let (tx, rx) = mpsc::channel(32);
+
+    // Coordinator task owns all mutable state — single writer, no locks needed
+    tokio::spawn(async move {
+        if let Err(e) = coordinator_task(config, rx).await {
+            error!("coordinator task failed: {e:#}");
+            std::process::exit(1);
+        }
+    });
+
+    let listener = TcpListener::bind(&args.listen)
+        .await
+        .with_context(|| format!("failed to bind {}", args.listen))?;
+
+    info!("listening for workers on {}", args.listen);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                let tx = tx.clone();
+                tokio::spawn(handle_connection(stream, addr, tx));
+            }
+            Err(e) => error!("accept error: {e}"),
+        }
+    }
+}
